@@ -82,37 +82,63 @@ class AccurateShakeTest:
         self.roi_end_point = None
         
         
-        # 用于显示的二值化图像
-        self.binary_image = None
+        # 用于显示的模板匹配图像
+        self.template_match_image = None
+        self.template_image = None
         
         # 按键防抖
         self.last_key_time = 0
         self.key_debounce_delay = 0.3  # 300ms防抖延迟
         
-        # 二值化参数控制
-        self.adaptive_thresh_blocksize = 15
-        self.adaptive_thresh_c = 8
-        self.binary_control_window = None
-        self.binary_params_changed = False
-        self.current_frame = None  # 保存当前帧用于实时更新
         
         # 自动切换到英文输入法
         self.switch_to_english_keyboard()
     
-    def update_binary_image_for_display(self, roi):
-        """更新用于显示的二值化图像"""
-        gray_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    def update_template_match_image_for_display(self, roi, detected_position=None):
+        """更新用于显示的模板匹配图像"""
+        # 检查图像是否已经是灰度图
+        if len(roi.shape) == 3:
+            gray_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        else:
+            gray_roi = roi.copy()
         
-        # 使用固定参数的自适应阈值处理
-        # 使用THRESH_BINARY_INV让线条变成白色
-        binary = cv2.adaptiveThreshold(gray_roi, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY_INV, 15, 8)
+        # 对模糊图像进行预处理（与模板匹配相同的处理）
+        blurred = cv2.GaussianBlur(gray_roi, (3, 3), 0)
+        enhanced = cv2.convertScaleAbs(blurred, alpha=1.5, beta=10)
         
-        # 轻微的形态学处理，避免破坏线条结构
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
-        binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)  # 使用闭运算连接断开的线条
+        # 转换为三通道以便画彩色标记
+        template_display = cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR)
         
-        # 保存二值化图像用于显示
-        self.binary_image = binary.copy()
+        # 如果识别到了十字，在图像上画出十字模板的位置
+        if detected_position is not None and self.user_roi is not None:
+            roi_x1, roi_y1, roi_x2, roi_y2 = self.user_roi
+            rx, ry = detected_position
+            
+            # 检查检测点是否在ROI内
+            if roi_x1 <= rx < roi_x2 and roi_y1 <= ry < roi_y2:
+                # 转换为ROI内的相对坐标
+                roi_x = rx - roi_x1
+                roi_y = ry - roi_y1
+                
+                # 画出模板匹配找到的十字位置
+                template_size = 24
+                half_size = template_size // 2
+                
+                # 画十字线（蓝色）
+                cv2.line(template_display, 
+                        (max(0, roi_x - half_size + 2), roi_y), 
+                        (min(enhanced.shape[1], roi_x + half_size - 2), roi_y), 
+                        (255, 0, 0), 2)
+                cv2.line(template_display, 
+                        (roi_x, max(0, roi_y - half_size + 2)), 
+                        (roi_x, min(enhanced.shape[0], roi_y + half_size - 2)), 
+                        (255, 0, 0), 2)
+                
+                # 画中心点（红色）
+                cv2.circle(template_display, (roi_x, roi_y), 3, (0, 0, 255), -1)
+        
+        # 保存处理后的图像用于显示
+        self.template_match_image = template_display
     
     def switch_to_english_keyboard(self):
         """切换键盘到英文模式"""
@@ -231,55 +257,9 @@ class AccurateShakeTest:
         if self.keyboard_thread:
             self.keyboard_thread.join(timeout=1)
     
-    def create_binary_control_window(self):
-        """创建二值化参数控制窗口"""
-        if self.binary_control_window is None:
-            self.binary_control_window = 'Binary Controls'
-            cv2.namedWindow(self.binary_control_window, cv2.WINDOW_NORMAL)
-            cv2.resizeWindow(self.binary_control_window, 400, 200)
-            
-            # 创建滑动条
-            cv2.createTrackbar('BlockSize', self.binary_control_window, self.adaptive_thresh_blocksize, 51, self.on_blocksize_change)
-            cv2.createTrackbar('C Value', self.binary_control_window, self.adaptive_thresh_c, 30, self.on_c_value_change)
-            
-            # 创建一个控制面板图像
-            control_img = np.zeros((200, 400, 3), dtype=np.uint8)
-            cv2.putText(control_img, 'Binary Threshold Controls', (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-            cv2.putText(control_img, 'BlockSize: Odd numbers only (3-51)', (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
-            cv2.putText(control_img, 'C Value: Threshold adjustment (0-30)', (10, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
-            cv2.putText(control_img, 'Real-time preview in Binary ROI window', (10, 130), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (100, 255, 100), 1)
-            cv2.imshow(self.binary_control_window, control_img)
     
-    def on_blocksize_change(self, val):
-        """块大小滑动条回调"""
-        # 确保是奇数且大于1
-        if val % 2 == 0:
-            val += 1
-        if val < 3:
-            val = 3
-        if self.adaptive_thresh_blocksize != val:
-            self.adaptive_thresh_blocksize = val
-            self.binary_params_changed = True
-            cv2.setTrackbarPos('BlockSize', self.binary_control_window, val)
     
-    def on_c_value_change(self, val):
-        """C值滑动条回调"""
-        if self.adaptive_thresh_c != val:
-            self.adaptive_thresh_c = val
-            self.binary_params_changed = True
     
-    def force_update_binary_display(self):
-        """强制更新二值化显示（用于暂停时的参数调整）"""
-        if self.current_frame is not None and self.user_roi:
-            # 获取当前ROI区域
-            roi_x1, roi_y1, roi_x2, roi_y2 = self.user_roi
-            roi = self.current_frame[roi_y1:roi_y2, roi_x1:roi_x2]
-            if roi.size > 0:
-                # 更新二值化图像
-                self.update_binary_image_for_display(roi)
-                self.binary_params_changed = False
-                return True
-        return False
     
     def get_key_input(self, timeout=1):
         """获取键盘输入，优先使用全局监听"""
@@ -535,10 +515,8 @@ class AccurateShakeTest:
         else:
             search_center = (frame.shape[1]//2, frame.shape[0]//2)
         
-        # 先获取ROI并生成二值化图像用于显示（无论质量如何都要更新）
+        # 先获取ROI用于检测
         roi, roi_offset = self.get_roi_for_detection(frame, search_center)
-        if roi.size > 0:
-            self.update_binary_image_for_display(roi)
         
         # 检测候选点
         candidates = self.detect_cross_multiple_methods(frame, search_center)
@@ -554,6 +532,9 @@ class AccurateShakeTest:
             # 检查置信度阈值
             if confidence < 0.7:
                 print(f"帧 {self.frame_count}: {method} 方法置信度过低 ({confidence:.3f} < 0.7)，跳过该帧")
+                
+                # 更新模板匹配显示图像，不显示十字（置信度过低）
+                self.update_template_match_image_for_display(roi, None)
                 
                 # 使用上一个位置
                 if self.raw_positions:
@@ -605,6 +586,9 @@ class AccurateShakeTest:
             
             self.stable_positions.append(stable_position)
             
+            # 更新模板匹配显示图像，显示检测到的十字
+            self.update_template_match_image_for_display(roi, raw_position)
+            
             return raw_position, stable_position, confidence
         
         # 如果检测失败，使用上一个位置
@@ -613,11 +597,19 @@ class AccurateShakeTest:
             last_stable = self.stable_positions[-1]
             self.raw_positions.append(last_raw)
             self.stable_positions.append(last_stable)
+            
+            # 更新模板匹配显示图像，不显示十字（检测失败）
+            self.update_template_match_image_for_display(roi, None)
+            
             return last_raw, last_stable, 0.0
         
         # 完全失败，使用搜索中心
         self.raw_positions.append(search_center)
         self.stable_positions.append(search_center)
+        
+        # 更新模板匹配显示图像，不显示十字（完全失败）
+        self.update_template_match_image_for_display(roi, None)
+        
         return search_center, search_center, 0.0
     
     def update_extreme_points(self, new_position):
@@ -892,9 +884,6 @@ class AccurateShakeTest:
         print("  按 'space' 单帧步进 (暂停时)")
         print("开始自动播放...")
         
-        # 创建二值化控制窗口
-        self.create_binary_control_window()
-        print(f"✓ 二值化参数控制窗口已创建，初始参数: BlockSize={self.adaptive_thresh_blocksize}, C={self.adaptive_thresh_c}")
 
         paused = False # 开始自动播放
         
@@ -933,10 +922,6 @@ class AccurateShakeTest:
                 
                 step_mode = False  # 单帧步进后停止
             
-            # 暂停时检查参数是否改变，并更新二值化显示
-            if paused and self.binary_params_changed:
-                if self.force_update_binary_display():
-                    print(f"参数已更新: BlockSize={self.adaptive_thresh_blocksize}, C={self.adaptive_thresh_c}")
             
             # 显示当前帧（如果有）
             if 'frame' in locals():
@@ -1008,34 +993,33 @@ class AccurateShakeTest:
                         
                         show_preview = True
                         
-                # 显示二值化图像窗口 - 一直显示
-                binary_window = 'Binary ROI'
-                if self.binary_image is not None:
-                    # 放大二值化图像以便更好观察
-                    binary_resized = cv2.resize(self.binary_image, None, fx=2, fy=2, interpolation=cv2.INTER_NEAREST)
-                    # 转换为三通道以便在上面画标记
-                    binary_display = cv2.cvtColor(binary_resized, cv2.COLOR_GRAY2BGR)
+                # 显示模板匹配图像窗口
+                template_window = 'Template Match ROI'
+                if self.template_match_image is not None:
+                    # 放大模板匹配图像以便更好观察
+                    template_resized = cv2.resize(self.template_match_image, None, fx=2, fy=2, interpolation=cv2.INTER_LINEAR)
+                    # template_match_image 已经是三通道BGR图像了，直接使用
+                    template_display = template_resized
                     
-                    # 在二值化图像上标记检测到的交叉点
-                    if self.raw_positions and self.user_roi:
-                        last_raw = self.raw_positions[-1]
-                        rx, ry = last_raw
-                        roi_x1, roi_y1, roi_x2, roi_y2 = self.user_roi
-                        if roi_x1 <= rx < roi_x2 and roi_y1 <= ry < roi_y2:
-                            px = int((rx - roi_x1) * 2) 
-                            py = int((ry - roi_y1) * 2)
-                            cv2.drawMarker(binary_display, (px, py), (0,255,0), markerType=cv2.MARKER_CROSS, markerSize=16, thickness=2)
+                    # 不再在模板匹配图像上额外标记交叉点，因为已经在update_template_match_image_for_display中处理了
                     
-                    cv2.imshow(binary_window, binary_display)
+                    cv2.imshow(template_window, template_display)
                 else:
-                    # 没有二值化图像时显示黑色占位图
+                    # 没有模板匹配图像时显示占位图
                     if self.user_roi:
                         roi_x1, roi_y1, roi_x2, roi_y2 = self.user_roi
                         roi_width = roi_x2 - roi_x1
                         roi_height = roi_y2 - roi_y1
                         placeholder = np.zeros((roi_height * 2, roi_width * 2, 3), dtype=np.uint8)
-                        cv2.putText(placeholder, 'No Binary Data', (10, roi_height), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (128, 128, 128), 2)
-                        cv2.imshow(binary_window, placeholder)
+                        cv2.putText(placeholder, 'No Template Data', (10, roi_height), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (128, 128, 128), 2)
+                        cv2.imshow(template_window, placeholder)
+                
+                # 显示十字模板窗口
+                template_pattern_window = 'Cross Template'
+                if self.template_image is not None:
+                    # 放大模板以便更好观察
+                    template_pattern_resized = cv2.resize(self.template_image, None, fx=8, fy=8, interpolation=cv2.INTER_NEAREST)
+                    cv2.imshow(template_pattern_window, template_pattern_resized)
                         
                 if show_preview and preview_img is not None:
                     cv2.imshow(preview_window, preview_img)
