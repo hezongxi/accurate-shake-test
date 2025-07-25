@@ -91,6 +91,13 @@ class AccurateShakeTest:
         self.last_key_time = 0
         self.key_debounce_delay = 0.3  # 300ms防抖延迟
         
+        # 二值化参数控制
+        self.adaptive_thresh_blocksize = 15
+        self.adaptive_thresh_c = 8
+        self.binary_control_window = None
+        self.binary_params_changed = False
+        self.current_frame = None  # 保存当前帧用于实时更新
+        
         # 自动切换到英文输入法
         self.switch_to_english_keyboard()
     
@@ -98,9 +105,10 @@ class AccurateShakeTest:
         """更新用于显示的二值化图像"""
         gray_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
         
-        # 使用与detect_by_contour相同的二值化处理
-        # 自适应阈值处理 - 使用THRESH_BINARY_INV让线条变成白色
-        binary = cv2.adaptiveThreshold(gray_roi, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY_INV, 15, 8)
+        # 使用可调参数的自适应阈值处理
+        # 使用THRESH_BINARY_INV让线条变成白色
+        binary = cv2.adaptiveThreshold(gray_roi, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY_INV, 
+                                     self.adaptive_thresh_blocksize, self.adaptive_thresh_c)
         
         # 形态学处理 - 使用十字形核
         kernel_size = 3 if gray_roi.shape[0] < 100 or gray_roi.shape[1] < 100 else 5
@@ -226,6 +234,56 @@ class AccurateShakeTest:
         self.keyboard_running = False
         if self.keyboard_thread:
             self.keyboard_thread.join(timeout=1)
+    
+    def create_binary_control_window(self):
+        """创建二值化参数控制窗口"""
+        if self.binary_control_window is None:
+            self.binary_control_window = 'Binary Controls'
+            cv2.namedWindow(self.binary_control_window, cv2.WINDOW_NORMAL)
+            cv2.resizeWindow(self.binary_control_window, 400, 200)
+            
+            # 创建滑动条
+            cv2.createTrackbar('BlockSize', self.binary_control_window, self.adaptive_thresh_blocksize, 51, self.on_blocksize_change)
+            cv2.createTrackbar('C Value', self.binary_control_window, self.adaptive_thresh_c, 30, self.on_c_value_change)
+            
+            # 创建一个控制面板图像
+            control_img = np.zeros((200, 400, 3), dtype=np.uint8)
+            cv2.putText(control_img, 'Binary Threshold Controls', (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+            cv2.putText(control_img, 'BlockSize: Odd numbers only (3-51)', (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+            cv2.putText(control_img, 'C Value: Threshold adjustment (0-30)', (10, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+            cv2.putText(control_img, 'Real-time preview in Binary ROI window', (10, 130), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (100, 255, 100), 1)
+            cv2.imshow(self.binary_control_window, control_img)
+    
+    def on_blocksize_change(self, val):
+        """块大小滑动条回调"""
+        # 确保是奇数且大于1
+        if val % 2 == 0:
+            val += 1
+        if val < 3:
+            val = 3
+        if self.adaptive_thresh_blocksize != val:
+            self.adaptive_thresh_blocksize = val
+            self.binary_params_changed = True
+            cv2.setTrackbarPos('BlockSize', self.binary_control_window, val)
+    
+    def on_c_value_change(self, val):
+        """C值滑动条回调"""
+        if self.adaptive_thresh_c != val:
+            self.adaptive_thresh_c = val
+            self.binary_params_changed = True
+    
+    def force_update_binary_display(self):
+        """强制更新二值化显示（用于暂停时的参数调整）"""
+        if self.current_frame is not None and self.user_roi:
+            # 获取当前ROI区域
+            roi_x1, roi_y1, roi_x2, roi_y2 = self.user_roi
+            roi = self.current_frame[roi_y1:roi_y2, roi_x1:roi_x2]
+            if roi.size > 0:
+                # 更新二值化图像
+                self.update_binary_image_for_display(roi)
+                self.binary_params_changed = False
+                return True
+        return False
     
     def get_key_input(self, timeout=1):
         """获取键盘输入，优先使用全局监听"""
@@ -545,24 +603,12 @@ class AccurateShakeTest:
         blurred = cv2.GaussianBlur(gray_roi, (3, 3), 0)
         enhanced = cv2.convertScaleAbs(blurred, alpha=1.2, beta=8)
         
-        # 根据图像质量动态调整自适应阈值参数
-        roi_contrast = gray_roi.std()
-        if roi_contrast < 30:  # 低对比度图像
-            block_size = 15  # 增大邻域
-            C = 5  # 增大常数，提高敏感度
-        else:
-            block_size = 11
-            C = 2
+        # 使用手动设置的自适应阈值参数
+        binary = cv2.adaptiveThreshold(enhanced, 255, cv2.ADAPTIVE_THRESH_MEAN_C, 
+                                      cv2.THRESH_BINARY_INV, self.adaptive_thresh_blocksize, self.adaptive_thresh_c)
         
-        # 自适应阈值
-        binary = cv2.adaptiveThreshold(enhanced, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-                                      cv2.THRESH_BINARY_INV, block_size, C)
-        
-        # 根据图像质量调整形态学核大小
-        if roi_contrast < 30:
-            kernel_size = 3  # 减小核，避免过度腐蚀模糊特征
-        else:
-            kernel_size = 5
+        # 使用固定的形态学核大小
+        kernel_size = 3 if roi.shape[0] < 100 or roi.shape[1] < 100 else 5
         
         # 十字形态学核
         kernel = cv2.getStructuringElement(cv2.MORPH_CROSS, (kernel_size, kernel_size))
@@ -1109,6 +1155,7 @@ class AccurateShakeTest:
             return
         # 旋转第一帧
         first_frame = cv2.rotate(first_frame, cv2.ROTATE_90_CLOCKWISE)
+        self.current_frame = first_frame.copy()  # 保存当前帧
 
         # 初始化自动开始标记
         self.roi_auto_start_flag = False
@@ -1159,6 +1206,10 @@ class AccurateShakeTest:
         print("  按 '+' 加速，'-' 减速")
         print("  按 'space' 单帧步进 (暂停时)")
         print("开始自动播放...")
+        
+        # 创建二值化控制窗口
+        self.create_binary_control_window()
+        print(f"✓ 二值化参数控制窗口已创建，初始参数: BlockSize={self.adaptive_thresh_blocksize}, C={self.adaptive_thresh_c}")
 
         paused = False # 开始自动播放
         
@@ -1173,6 +1224,7 @@ class AccurateShakeTest:
                     
                 # 旋转帧
                 frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+                self.current_frame = frame.copy()  # 保存当前帧
                 self.frame_count += 1
                 
                 # 检测十字中心
@@ -1193,6 +1245,7 @@ class AccurateShakeTest:
                     
                 # 旋转帧
                 frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+                self.current_frame = frame.copy()  # 保存当前帧
                 self.frame_count += 1
                 
                 # 检测十字中心
@@ -1204,6 +1257,11 @@ class AccurateShakeTest:
                     print(f"参考中心设置为: {raw_pos}")
                 
                 step_mode = False  # 单帧步进后停止
+            
+            # 暂停时检查参数是否改变，并更新二值化显示
+            if paused and self.binary_params_changed:
+                if self.force_update_binary_display():
+                    print(f"参数已更新: BlockSize={self.adaptive_thresh_blocksize}, C={self.adaptive_thresh_c}")
             
             # 显示当前帧（如果有）
             if 'frame' in locals():
