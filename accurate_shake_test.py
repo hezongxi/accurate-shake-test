@@ -551,6 +551,23 @@ class AccurateShakeTest:
             confidence = best_detection['confidence']
             method = best_detection['method']
             
+            # 检查置信度阈值
+            if confidence < 0.7:
+                print(f"帧 {self.frame_count}: {method} 方法置信度过低 ({confidence:.3f} < 0.7)，跳过该帧")
+                
+                # 使用上一个位置
+                if self.raw_positions:
+                    last_raw = self.raw_positions[-1]
+                    last_stable = self.stable_positions[-1]
+                    self.raw_positions.append(last_raw)
+                    self.stable_positions.append(last_stable)
+                    return last_raw, last_stable, 0.0
+                else:
+                    # 如果没有历史位置，使用搜索中心
+                    self.raw_positions.append(search_center)
+                    self.stable_positions.append(search_center)
+                    return search_center, search_center, 0.0
+            
             # 打印检测方法信息
             print(f"帧 {self.frame_count}: 使用 {method} 方法检测到十字, 置信度: {confidence:.3f}")
             
@@ -558,7 +575,16 @@ class AccurateShakeTest:
             self.raw_positions.append(raw_position)
             self.detection_confidence.append(confidence)
             
-            # 实时更新极值点
+            # 设置参考中心（如果还没有设置）
+            reference_center_just_set = False
+            if self.reference_center is None:
+                self.reference_center = raw_position
+                reference_center_just_set = True
+                print(f"参考中心设置为: {raw_position}")
+                # 重置极值点，避免参考中心被算入抖动范围
+                self.reset_extreme_points()
+            
+            # 实时更新极值点（参考中心不会被重复添加）
             self.update_extreme_points(raw_position)
             
             # 添加到历史记录
@@ -631,24 +657,21 @@ class AccurateShakeTest:
         """计算振动指标 - 按照防抖振动测试标准：找出最高点与最低点，然后计算差量"""
         if len(self.raw_positions) < 2:
             return 0, None, None, 0, None, None
+        
+        # 使用实时更新的极值点（ROI窗口显示的数据）
+        if (self.max_y_val is not None and self.min_y_val is not None and 
+            self.max_x_val is not None and self.min_x_val is not None):
             
-        positions = np.array(self.raw_positions)
-        
-        # 找出Y方向的最高点和最低点
-        max_y = np.max(positions[:, 1])
-        min_y = np.min(positions[:, 1])
-        
-        # 找出X方向的最右点和最左点
-        max_x = np.max(positions[:, 0])
-        min_x = np.min(positions[:, 0])
-        
-        # 计算Y方向差量
-        y_range = max_y - min_y  # Y方向最高点与最低点的差
-        
-        # 计算X方向差量
-        x_range = max_x - min_x  # X方向最右点与最左点的差
+            # 计算Y方向差量
+            y_range = self.max_y_val - self.min_y_val
             
-        return y_range, max_y, min_y, x_range, max_x, min_x
+            # 计算X方向差量
+            x_range = self.max_x_val - self.min_x_val
+            
+            return y_range, self.max_y_val, self.min_y_val, x_range, self.max_x_val, self.min_x_val
+        else:
+            # 如果极值点还没有初始化，返回0值
+            return 0, None, None, 0, None, None
     
     def draw_results(self, frame, raw_pos, stable_pos, confidence):
         """绘制检测结果"""
@@ -859,9 +882,6 @@ class AccurateShakeTest:
         # 在选择的ROI内检测第一个交叉点
         self.frame_count += 1
         raw_pos, stable_pos, confidence = self.detect_cross_center(first_frame)
-        if self.reference_center is None:
-            self.reference_center = raw_pos
-            print(f"参考中心设置为: {raw_pos}")
 
         # --- 主播放与分析循环 ---
         print("\n=== 分析阶段 ===")
@@ -894,11 +914,6 @@ class AccurateShakeTest:
                 
                 # 检测十字中心
                 raw_pos, stable_pos, confidence = self.detect_cross_center(frame)
-                
-                # 设置参考中心
-                if self.reference_center is None:
-                    self.reference_center = raw_pos
-                    print(f"参考中心设置为: {raw_pos}")
             
             # 单帧步进模式
             elif step_mode:
@@ -915,11 +930,6 @@ class AccurateShakeTest:
                 
                 # 检测十字中心
                 raw_pos, stable_pos, confidence = self.detect_cross_center(frame)
-                
-                # 设置参考中心
-                if self.reference_center is None:
-                    self.reference_center = raw_pos
-                    print(f"参考中心设置为: {raw_pos}")
                 
                 step_mode = False  # 单帧步进后停止
             
@@ -955,9 +965,46 @@ class AccurateShakeTest:
                                 py = int((ry - roi_y1) * 2)
                                 cv2.drawMarker(preview_img, (px, py), (0,0,255), markerType=cv2.MARKER_CROSS, markerSize=16, thickness=2)
                         
-                        # 在左上角显示帧数
+                        # 在左上角显示帧数和坐标信息
+                        line_height = 25
+                        y_pos = 20
+                        
+                        # 帧数
                         frame_text = f"Frame: {self.frame_count}"
-                        cv2.putText(preview_img, frame_text, (5, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+                        cv2.putText(preview_img, frame_text, (5, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+                        y_pos += line_height
+                        
+                        # 当前识别点坐标
+                        if self.raw_positions:
+                            current_pos = self.raw_positions[-1]
+                            current_text = f"Current: ({current_pos[0]}, {current_pos[1]})"
+                            cv2.putText(preview_img, current_text, (5, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                            y_pos += line_height
+                        
+                        # Y方向极值点和差值
+                        if self.max_y_val is not None and self.min_y_val is not None:
+                            y_max_text = f"Y-Max: ({self.max_y_pos[0] if self.max_y_pos else 0}, {self.max_y_val})"
+                            y_min_text = f"Y-Min: ({self.min_y_pos[0] if self.min_y_pos else 0}, {self.min_y_val})"
+                            y_diff_text = f"Y-Diff: {self.max_y_val - self.min_y_val:.1f}"
+                            
+                            cv2.putText(preview_img, y_max_text, (5, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 139), 2)
+                            y_pos += line_height
+                            cv2.putText(preview_img, y_min_text, (5, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 128, 0), 2)
+                            y_pos += line_height
+                            cv2.putText(preview_img, y_diff_text, (5, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 2)
+                            y_pos += line_height
+                        
+                        # X方向极值点和差值
+                        if self.max_x_val is not None and self.min_x_val is not None:
+                            x_max_text = f"X-Max: ({self.max_x_val}, {self.max_x_pos[1] if self.max_x_pos else 0})"
+                            x_min_text = f"X-Min: ({self.min_x_val}, {self.min_x_pos[1] if self.min_x_pos else 0})"
+                            x_diff_text = f"X-Diff: {self.max_x_val - self.min_x_val:.1f}"
+                            
+                            cv2.putText(preview_img, x_max_text, (5, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (128, 0, 128), 2)
+                            y_pos += line_height
+                            cv2.putText(preview_img, x_min_text, (5, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 165, 255), 2)
+                            y_pos += line_height
+                            cv2.putText(preview_img, x_diff_text, (5, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 2)
                         
                         show_preview = True
                         
