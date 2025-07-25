@@ -81,8 +81,6 @@ class AccurateShakeTest:
         self.roi_start_point = None
         self.roi_end_point = None
         
-        # 十字线质量阈值（可调整）
-        self.quality_threshold = 0.9  # 默认阈值，越低越宽松
         
         # 用于显示的二值化图像
         self.binary_image = None
@@ -105,15 +103,13 @@ class AccurateShakeTest:
         """更新用于显示的二值化图像"""
         gray_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
         
-        # 使用可调参数的自适应阈值处理
+        # 使用固定参数的自适应阈值处理
         # 使用THRESH_BINARY_INV让线条变成白色
-        binary = cv2.adaptiveThreshold(gray_roi, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY_INV, 
-                                     self.adaptive_thresh_blocksize, self.adaptive_thresh_c)
+        binary = cv2.adaptiveThreshold(gray_roi, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY_INV, 15, 8)
         
-        # 形态学处理 - 使用十字形核
-        kernel_size = 3 if gray_roi.shape[0] < 100 or gray_roi.shape[1] < 100 else 5
-        kernel = cv2.getStructuringElement(cv2.MORPH_CROSS, (kernel_size, kernel_size))
-        binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
+        # 轻微的形态学处理，避免破坏线条结构
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+        binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)  # 使用闭运算连接断开的线条
         
         # 保存二值化图像用于显示
         self.binary_image = binary.copy()
@@ -454,20 +450,13 @@ class AccurateShakeTest:
         if roi.size == 0:
             return candidates
             
-        # 方法1: 精确模板匹配
+        # 只使用模板匹配检测
         template_result = self.detect_by_template(roi, roi_offset)
         if template_result:
             candidates.append(template_result)
-            
-        # 方法2: 直线交点检测
-        lines_result = self.detect_by_lines(roi, roi_offset)
-        if lines_result:
-            candidates.append(lines_result)
-            
-        # 方法3: 轮廓重心检测
-        contour_result = self.detect_by_contour(roi, roi_offset)
-        if contour_result:
-            candidates.append(contour_result)
+            print(f"  - template方法检测成功，置信度: {template_result['confidence']:.3f}")
+        else:
+            print(f"  - template方法检测失败")
             
         return candidates
     
@@ -523,315 +512,18 @@ class AccurateShakeTest:
         
         return None
     
-    def detect_by_lines(self, roi, roi_offset):
-        """直线检测方法"""
-        gray_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-        
-        # 对模糊图像进行预处理
-        blurred = cv2.GaussianBlur(gray_roi, (3, 3), 0)
-        enhanced = cv2.convertScaleAbs(blurred, alpha=1.3, beta=5)
-        
-        # 根据图像质量动态调整Canny参数
-        roi_contrast = gray_roi.std()
-        if roi_contrast < 30:  # 低对比度图像
-            low_thresh = 20
-            high_thresh = 80
-        else:
-            low_thresh = 40
-            high_thresh = 120
-        
-        # 边缘检测
-        edges = cv2.Canny(enhanced, low_thresh, high_thresh)
-        
-        # 根据图像质量动态调整霍夫参数
-        if roi_contrast < 30:
-            threshold = 10  # 降低阈值
-            min_line_length = 8
-            max_line_gap = 4
-        else:
-            threshold = 15
-            min_line_length = 10
-            max_line_gap = 2
-        
-        # 霍夫直线检测
-        lines = cv2.HoughLinesP(edges, 1, np.pi/180, threshold=threshold, 
-                               minLineLength=min_line_length, maxLineGap=max_line_gap)
-        
-        if lines is None:
-            return None
-            
-        # 分类直线
-        horizontal_lines = []
-        vertical_lines = []
-        
-        for line in lines:
-            x1, y1, x2, y2 = line[0]
-            angle = math.atan2(y2 - y1, x2 - x1) * 180 / math.pi
-            
-            if abs(angle) < 15 or abs(angle) > 165:
-                horizontal_lines.append(line[0])
-            elif abs(abs(angle) - 90) < 15:
-                vertical_lines.append(line[0])
-        
-        # 找交点
-        best_intersection = None
-        best_score = 0
-        
-        for h_line in horizontal_lines:
-            for v_line in vertical_lines:
-                intersection = self.get_line_intersection(h_line, v_line)
-                if intersection:
-                    x, y = intersection
-                    # 评分：越接近ROI中心得分越高
-                    roi_center_x = roi.shape[1] // 2
-                    roi_center_y = roi.shape[0] // 2
-                    distance = math.sqrt((x - roi_center_x)**2 + (y - roi_center_y)**2)
-                    score = 1.0 / (1.0 + distance)
-                    
-                    if score > best_score:
-                        best_score = score
-                        global_pos = (x + roi_offset[0], y + roi_offset[1])
-                        best_intersection = {'position': global_pos, 'confidence': score, 'method': 'lines'}
-        
-        return best_intersection
     
-    def detect_by_contour(self, roi, roi_offset):
-        """轮廓检测方法"""
-        gray_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-        
-        # 对模糊图像进行预处理
-        blurred = cv2.GaussianBlur(gray_roi, (3, 3), 0)
-        enhanced = cv2.convertScaleAbs(blurred, alpha=1.2, beta=8)
-        
-        # 使用手动设置的自适应阈值参数
-        binary = cv2.adaptiveThreshold(enhanced, 255, cv2.ADAPTIVE_THRESH_MEAN_C, 
-                                      cv2.THRESH_BINARY_INV, self.adaptive_thresh_blocksize, self.adaptive_thresh_c)
-        
-        # 使用固定的形态学核大小
-        kernel_size = 3 if roi.shape[0] < 100 or roi.shape[1] < 100 else 5
-        
-        # 十字形态学核
-        kernel = cv2.getStructuringElement(cv2.MORPH_CROSS, (kernel_size, kernel_size))
-        binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
-        
-        # 保存二值化图像用于显示
-        self.binary_image = binary.copy()
-        
-        # 寻找轮廓
-        contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
-        if not contours:
-            return None
-            
-        # 选择最合适的轮廓
-        best_contour = None
-        best_score = 0
-        
-        for contour in contours:
-            area = cv2.contourArea(contour)
-            if area < 20:  # 过小的轮廓
-                continue
-                
-            # 计算轮廓的特征
-            x, y, w, h = cv2.boundingRect(contour)
-            aspect_ratio = max(w, h) / min(w, h)
-            extent = area / (w * h)
-            
-            # 十字形状的特征：宽高比接近1，填充率适中
-            score = 1.0 / (1.0 + abs(aspect_ratio - 1.0)) * extent
-            
-            if score > best_score:
-                best_score = score
-                best_contour = contour
-        
-        if best_contour is not None:
-            # 计算重心
-            M = cv2.moments(best_contour)
-            if M["m00"] > 0:
-                cx = int(M["m10"] / M["m00"])
-                cy = int(M["m01"] / M["m00"])
-                global_pos = (cx + roi_offset[0], cy + roi_offset[1])
-                return {'position': global_pos, 'confidence': best_score, 'method': 'contour'}
-        
-        return None
-    
-    def get_line_intersection(self, line1, line2):
-        """计算两条直线的交点"""
-        x1, y1, x2, y2 = line1
-        x3, y3, x4, y4 = line2
-        
-        denom = (x1 - x2) * (y3 - y4) - (y1 - y2) * (x3 - x4)
-        if abs(denom) < 1e-6:
-            return None
-        
-        t = ((x1 - x3) * (y3 - y4) - (y1 - y3) * (x3 - x4)) / denom
-        u = -((x1 - x2) * (y1 - y3) - (y1 - y2) * (x1 - x3)) / denom
-        
-        if 0 <= t <= 1 and 0 <= u <= 1:
-            x = x1 + t * (x2 - x1)
-            y = y1 + t * (y2 - y1)
-            return (int(x), int(y))
-        
-        return None
     
     def select_best_detection(self, candidates, search_center):
         """从候选点中选择最佳检测结果"""
         if not candidates:
             return None
-            
-        # 如果只有一个候选点
-        if len(candidates) == 1:
-            return candidates[0]
         
-        # 多个候选点：综合考虑置信度和距离
-        best_candidate = None
-        best_score = 0
-        
-        for candidate in candidates:
-            pos = candidate['position']
-            confidence = candidate['confidence']
-            
-            # 计算与搜索中心的距离
-            distance = math.sqrt((pos[0] - search_center[0])**2 + (pos[1] - search_center[1])**2)
-            distance_score = 1.0 / (1.0 + distance / 50.0)  # 距离越近分数越高
-            
-            # 综合得分
-            total_score = confidence * 0.7 + distance_score * 0.3
-            
-            if total_score > best_score:
-                best_score = total_score
-                best_candidate = candidate
-        
-        return best_candidate
+        # 现在只有模板匹配一种方法，直接返回第一个结果
+        return candidates[0]
     
-    def evaluate_horizontal_line_quality(self, roi):
-        """评估横线质量，返回质量分数 (0-1)"""
-        gray_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-        height, width = gray_roi.shape
-        
-        # 1. 基础对比度检查
-        contrast = gray_roi.std()
-        if contrast < 15:  # 极低对比度直接返回0
-            return 0.0
-        
-        # 2. 边缘检测
-        edges = cv2.Canny(gray_roi, 30, 100)
-        
-        # 3. 横线专用检测 - 使用水平Sobel算子增强横线
-        sobel_h = cv2.Sobel(gray_roi, cv2.CV_64F, 0, 1, ksize=3)
-        sobel_h = np.abs(sobel_h)
-        
-        # 4. 水平投影分析
-        v_projection = np.sum(edges, axis=1)  # 垂直投影（检测横线）
-        
-        # 寻找中心区域的横线强度
-        center_y = height // 2
-        center_region = v_projection[max(0, center_y-10):center_y+10]
-        
-        if len(center_region) == 0:
-            return 0.0
-            
-        # 横线强度评估
-        max_projection = np.max(center_region)
-        avg_projection = np.mean(v_projection)
-        
-        # 计算峰值比 - 中心区域应该有明显的峰值
-        if avg_projection > 0:
-            peak_ratio = max_projection / (avg_projection + 1e-6)
-        else:
-            peak_ratio = 0
-        
-        # 5. 横线连续性检查 - 检查中心水平线的连续性
-        center_row = gray_roi[center_y, :]
-        horizontal_gradient = np.abs(np.diff(center_row.astype(float)))
-        
-        # 6. 综合评分 - 修改评分范围，使其更平滑
-        # 投影分数：使用sigmoid函数使分数更平滑
-        projection_score = max_projection / (max_projection + 20.0)  # sigmoid-like curve
-        
-        # 峰值比分数：调整除数，使峰值比在1-5范围内有更好的分布
-        peak_score = min(1.0, max(0.0, (peak_ratio - 1.0) / 4.0))  # 峰值比1-5映射到0-1
-        
-        # 连续性分数：调整梯度阈值，减少敏感度
-        high_gradient_count = np.sum(horizontal_gradient > 50)  # 提高阈值从30到50
-        continuity_score = max(0.0, 1.0 - (high_gradient_count / len(horizontal_gradient)))
-        
-        quality = (projection_score * 0.4 + peak_score * 0.4 + continuity_score * 0.2)
-        
-        return quality
     
-    def evaluate_vertical_line_quality(self, roi):
-        """评估竖线质量，返回质量分数 (0-1)"""
-        gray_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-        height, width = gray_roi.shape
-        
-        # 1. 基础对比度检查
-        contrast = gray_roi.std()
-        if contrast < 15:  # 极低对比度直接返回0
-            return 0.0
-        
-        # 2. 边缘检测
-        edges = cv2.Canny(gray_roi, 30, 100)
-        
-        # 3. 竖线专用检测 - 使用垂直Sobel算子增强竖线
-        sobel_v = cv2.Sobel(gray_roi, cv2.CV_64F, 1, 0, ksize=3)
-        sobel_v = np.abs(sobel_v)
-        
-        # 4. 水平投影分析
-        h_projection = np.sum(edges, axis=0)  # 水平投影（检测竖线）
-        
-        # 寻找中心区域的竖线强度
-        center_x = width // 2
-        center_region = h_projection[max(0, center_x-10):center_x+10]
-        
-        if len(center_region) == 0:
-            return 0.0
-            
-        # 竖线强度评估
-        max_projection = np.max(center_region)
-        avg_projection = np.mean(h_projection)
-        
-        # 计算峰值比 - 中心区域应该有明显的峰值
-        if avg_projection > 0:
-            peak_ratio = max_projection / (avg_projection + 1e-6)
-        else:
-            peak_ratio = 0
-        
-        # 5. 竖线连续性检查 - 检查中心垂直线的连续性
-        center_col = gray_roi[:, center_x]
-        vertical_gradient = np.abs(np.diff(center_col.astype(float)))
-        
-        # 6. 综合评分 - 修改评分范围，使其更平滑
-        # 投影分数：使用sigmoid函数使分数更平滑
-        projection_score = max_projection / (max_projection + 20.0)  # sigmoid-like curve
-        
-        # 峰值比分数：调整除数，使峰值比在1-5范围内有更好的分布
-        peak_score = min(1.0, max(0.0, (peak_ratio - 1.0) / 4.0))  # 峰值比1-5映射到0-1
-        
-        # 连续性分数：调整梯度阈值，减少敏感度
-        high_gradient_count = np.sum(vertical_gradient > 50)  # 提高阈值从30到50
-        continuity_score = max(0.0, 1.0 - (high_gradient_count / len(vertical_gradient)))
-        
-        quality = (projection_score * 0.4 + peak_score * 0.4 + continuity_score * 0.2)
-        
-        return quality
 
-    def evaluate_cross_quality(self, frame, search_center):
-        """评估十字线质量，分别检查横线和竖线，返回(横线质量, 竖线质量, 是否通过)"""
-        # 获取ROI区域
-        roi, roi_offset = self.get_roi_for_detection(frame, search_center)
-        if roi.size == 0:
-            return 0.0, 0.0, False
-        
-        # 分别评估横线和竖线质量
-        horizontal_quality = self.evaluate_horizontal_line_quality(roi)
-        vertical_quality = self.evaluate_vertical_line_quality(roi)
-        
-        # 只要有一根线的质量低于阈值就认为不通过
-        is_valid = (horizontal_quality >= self.quality_threshold and 
-                   vertical_quality >= self.quality_threshold)
-        
-        return horizontal_quality, vertical_quality, is_valid
 
     def detect_cross_center(self, frame):
         """主检测函数"""
@@ -848,32 +540,6 @@ class AccurateShakeTest:
         if roi.size > 0:
             self.update_binary_image_for_display(roi)
         
-        # 评估十字线质量 - 分别检查横线和竖线
-        h_quality, v_quality, is_valid = self.evaluate_cross_quality(frame, search_center)
-        
-        # 如果任一线条质量太低，跳过此帧的检测
-        if not is_valid:
-            failed_lines = []
-            if h_quality < self.quality_threshold:
-                failed_lines.append(f"横线({h_quality:.2f})")
-            if v_quality < self.quality_threshold:
-                failed_lines.append(f"竖线({v_quality:.2f})")
-            
-            print(f"警告：帧 {self.frame_count} 线条质量过低 [横线:{h_quality:.2f}, 竖线:{v_quality:.2f}, 阈值:{self.quality_threshold}] [{', '.join(failed_lines)}]，跳过检测")
-            
-            # 使用上一个位置
-            if self.raw_positions:
-                last_raw = self.raw_positions[-1]
-                last_stable = self.stable_positions[-1]
-                self.raw_positions.append(last_raw)
-                self.stable_positions.append(last_stable)
-                return last_raw, last_stable, 0.0
-            else:
-                # 如果没有历史位置，使用搜索中心
-                self.raw_positions.append(search_center)
-                self.stable_positions.append(search_center)
-                return search_center, search_center, 0.0
-        
         # 检测候选点
         candidates = self.detect_cross_multiple_methods(frame, search_center)
         
@@ -883,15 +549,14 @@ class AccurateShakeTest:
         if best_detection:
             raw_position = best_detection['position']
             confidence = best_detection['confidence']
+            method = best_detection['method']
             
-            # 将横线和竖线质量分数融入最终置信度
-            # 使用两条线质量的较小值作为质量权重，确保两条线都要清晰
-            quality_weight = min(h_quality, v_quality)
-            final_confidence = confidence * quality_weight
+            # 打印检测方法信息
+            print(f"帧 {self.frame_count}: 使用 {method} 方法检测到十字, 置信度: {confidence:.3f}")
             
             # 记录原始位置（用于抖动测量）
             self.raw_positions.append(raw_position)
-            self.detection_confidence.append(final_confidence)
+            self.detection_confidence.append(confidence)
             
             # 实时更新极值点
             self.update_extreme_points(raw_position)
@@ -914,7 +579,7 @@ class AccurateShakeTest:
             
             self.stable_positions.append(stable_position)
             
-            return raw_position, stable_position, final_confidence
+            return raw_position, stable_position, confidence
         
         # 如果检测失败，使用上一个位置
         if self.raw_positions:
